@@ -1,15 +1,37 @@
 ﻿#!/usr/bin/env python3
 """Send a typed judgment request to TypeSafe Jev and print its JSON response."""
 
+import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+TRACE_LOG_FILE = Path(__file__).resolve().parent.parent / "jev-trace.log"
+
+
+def log_trace(message: str) -> None:
+    """Write trace metadata to stderr and append it to the local trace log."""
+    print(message, file=sys.stderr)
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        if TRACE_LOG_FILE.exists() and TRACE_LOG_FILE.stat().st_size:
+            with TRACE_LOG_FILE.open("rb") as existing_log:
+                existing_log.seek(-1, os.SEEK_END)
+                needs_separator = existing_log.read(1) != b"\n"
+        else:
+            needs_separator = False
+        with TRACE_LOG_FILE.open("a", encoding="utf-8") as log_file:
+            if needs_separator:
+                log_file.write("\n")
+            log_file.write(f"{timestamp} {message}\n")
+    except OSError as exc:
+        print(f"[jev trace] ログを書き込めませんでした ({TRACE_LOG_FILE}): {exc}", file=sys.stderr)
 
 
 def load_api_key_from_env_file() -> None:
@@ -39,6 +61,14 @@ def load_api_key_from_env_file() -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="TypeSafe Jevへ構造化された判断依頼を送信します。")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="通信の詳細を標準エラーとjev-trace.logに記録します（APIキーは記録しません）",
+    )
+    args = parser.parse_args()
+
     load_api_key_from_env_file()
     api_key = os.environ.get("TYPESAFE_API_KEY")
     if not api_key:
@@ -55,9 +85,10 @@ def main() -> int:
         print('リクエストは "model"、"state"、"questions" を含むJSONオブジェクトにしてください。', file=sys.stderr)
         return 2
 
+    request_body = json.dumps(payload).encode("utf-8")
     request = Request(
         ENDPOINT,
-        data=json.dumps(payload).encode("utf-8"),
+        data=request_body,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -65,22 +96,71 @@ def main() -> int:
         method="POST",
     )
 
+    started_at = time.perf_counter()
+    if args.trace:
+        questions = payload.get("questions")
+        question_count = len(questions) if isinstance(questions, dict) else "unknown"
+        state = payload.get("state")
+        log_trace(
+            f"[jev trace] POST {ENDPOINT}; model={payload.get('model', 'unknown')}; "
+            f"state_type={type(state).__name__}; questions={question_count}; "
+            f"request_bytes={len(request_body)}"
+        )
+        log_trace(
+            "[jev trace] request="
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
+
     try:
         with urlopen(request, timeout=30) as response:
             result = response.read().decode("utf-8")
+            status = response.status
     except HTTPError as exc:
+        elapsed = time.perf_counter() - started_at
         detail = exc.read().decode("utf-8", errors="replace")
+        if args.trace:
+            log_trace(f"[jev trace] HTTP {exc.code}; elapsed={elapsed:.3f}s")
+            log_trace("[jev trace] response_error=" + json.dumps(detail, ensure_ascii=False))
         print(f"TypeSafe APIエラー (HTTP {exc.code}): {detail}", file=sys.stderr)
         return 1
     except (URLError, TimeoutError) as exc:
+        elapsed = time.perf_counter() - started_at
+        if args.trace:
+            log_trace(
+                f"[jev trace] request failed; elapsed={elapsed:.3f}s; "
+                f"error_type={type(exc).__name__}"
+            )
         print(f"TypeSafe APIに接続できませんでした: {exc}", file=sys.stderr)
         return 1
 
+    elapsed = time.perf_counter() - started_at
     try:
         parsed = json.loads(result)
     except json.JSONDecodeError:
+        if args.trace:
+            log_trace(
+                f"[jev trace] HTTP {status}; elapsed={elapsed:.3f}s; response was not valid JSON"
+            )
+            log_trace("[jev trace] response_raw=" + json.dumps(result, ensure_ascii=False))
         print("TypeSafe APIからJSON以外の応答が返されました。", file=sys.stderr)
         return 1
+
+    if args.trace:
+        log_trace(
+            "[jev trace] response="
+            + json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        )
+        usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
+        usage_summary = ""
+        if isinstance(usage, dict):
+            input_tokens = usage.get("input_tokens", "unknown")
+            output_tokens = usage.get("output_tokens", "unknown")
+            usage_summary = f"; input_tokens={input_tokens}; output_tokens={output_tokens}"
+        model = parsed.get("model", "unknown") if isinstance(parsed, dict) else "unknown"
+        log_trace(
+            f"[jev trace] HTTP {status}; elapsed={elapsed:.3f}s; "
+            f"response_model={model}{usage_summary}"
+        )
 
     print(json.dumps(parsed, ensure_ascii=False, indent=2))
     return 0

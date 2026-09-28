@@ -31,3 +31,13 @@ TYPESAFE_API_KEY=ここにAPIキーを入力
 - `.env.example` — 実際の認証情報を含まないAPIキー設定例
 - `install.ps1` — `.env` を保ったまま、管理対象のスキルファイルをDevin CLIの共通スキルフォルダーへコピーするスクリプト
 
+
+## 通信ログ
+
+リクエストJSONを `request.json` に用意し、次のように実行すると詳細ログを記録します。
+
+```powershell
+Get-Content request.json -Raw | py scripts/jev_decide.py --trace
+```
+
+ログには送信先、モデル名、HTTPステータス、所要時間、トークン数、送信したリクエストJSONとAPI応答JSONが含まれます。APIキーは記録しません。リクエストの `state` や回答内容はログに残るため、取り扱いに注意してください。ログはリポジトリ直下の `jev-trace.log` に追記され、Gitの対象外です。
